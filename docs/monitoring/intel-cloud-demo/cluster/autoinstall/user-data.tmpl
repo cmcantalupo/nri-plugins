@@ -1,0 +1,30 @@
+#cloud-config
+# Rendered by cluster/10-baremetal-provision.sh (`seed`) from cluster/inventory.env.
+# NoCloud autoinstall seed: the Ubuntu 26.04 live-server installer (subiquity)
+# reads this to install unattended, then reboots into a clean system with
+# key-based SSH. Tokens of the form @NAME@ are substituted at render time;
+# whole-line @BLOCK@ markers are replaced with generated (or empty) YAML.
+autoinstall:
+  version: 1
+  interactive-sections: []
+@APT@
+  identity:
+    hostname: "@REIMAGE_HOSTNAME@"
+    username: "@NODE_USER@"
+    # Random locked hash: console password login is disabled, access is key-only.
+    password: "@PASSWORD_HASH@"
+  ssh:
+    install-server: true
+    allow-pw: false
+    authorized-keys:
+      - "@SSH_PUBKEY@"
+  storage:
+@STORAGE@
+  network:
+    version: 2
+    ethernets:
+@NETWORK_ETH@
+  late-commands:
+    - curtin in-target -- bash -c 'echo "@NODE_USER@ ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/90-aet-nopasswd'
+    - curtin in-target -- chmod 440 /etc/sudoers.d/90-aet-nopasswd
+@LATE_PROXY@

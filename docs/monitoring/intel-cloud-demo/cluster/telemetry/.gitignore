@@ -1,0 +1,4 @@
+# Build cache and artifacts produced by build-nri-image.sh: cloned fork trees
+# and the exported image tar/provenance. Never committed.
+/.src/
+/images/

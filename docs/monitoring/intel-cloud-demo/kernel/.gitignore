@@ -1,0 +1,4 @@
+/build/
+/host-kernel.config
+/cwf-stock.config
+/cwf-stock.env

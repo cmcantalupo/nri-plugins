@@ -1,0 +1,5 @@
+# Site-specific allocation description (hostnames/IPs); never committed.
+inventory.env
+
+# Bare-metal re-image work dir (ISO, extracted kernel/initrd, rendered seed).
+.baremetal/
