@@ -1,0 +1,140 @@
+# SPDX-FileCopyrightText: Copyright 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+# nri-resctrl-mon: the per-pod AET source.
+#
+# An NRI plugin DaemonSet that creates a resctrl mon_group per pod, assigns the
+# pod's RMID, reads mon_PERF_PKG_*/{core_energy,activity,...} and pushes them
+# over OTLP/gRPC to otel-collector-resctrl. Build the image with
+# telemetry/build-nri-image.sh (or use a published image) and import it into
+# containerd on each node as localhost/nri-resctrl-mon:aet.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nri-resctrl-mon-config
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: nri-resctrl-mon
+data:
+  config.yaml: |
+    resctrlPath: /sys/fs/resctrl
+    namespaces: []
+    labelSelector: {}
+    telemetry:
+      prometheus:
+        enabled: false
+        listenAddress: ":9100"
+        namespace: ""
+      otlp:
+        enabled: true
+        endpoint: "otel-collector-resctrl.monitoring.svc:4317"
+        protocol: grpc
+        interval: 15s
+        insecure: true
+      perfCounters:
+        enabled: true
+        include: []
+        exclude: []
+      scanAllGroups: false
+      resourceAttributes: {}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nri-resctrl-mon
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: nri-resctrl-mon
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nri-resctrl-mon
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nri-resctrl-mon
+    spec:
+      priorityClassName: system-node-critical
+      # hostPID: the plugin assigns each pod's container tasks into its resctrl
+      # mon_group by writing host PIDs into .../tasks; that requires the host PID
+      # namespace to observe the real (host) PIDs of container processes.
+      hostPID: true
+      nodeSelector:
+        kubernetes.io/os: linux
+        energy.intel.com/aet: "true"
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: nri-resctrl-mon
+          # Built by telemetry/build-nri-image.sh from the NRI_REPO/NRI_BRANCH +
+          # GORESCTRL_REPO/GORESCTRL_BRANCH forks; that script stamps the exact
+          # source commit SHAs as OCI labels (org.opencontainers.image.*) and
+          # writes them to the build-provenance file, so the image is traceable
+          # to reviewed source even though it is imported locally (no registry
+          # digest to pin).
+          image: localhost/nri-resctrl-mon:aet
+          imagePullPolicy: IfNotPresent
+          command:
+            - nri-resctrl-mon
+            - --idx
+            - "90"
+            - --config
+            - /etc/nri/resctrl-mon/config.yaml
+            - -v
+          securityContext:
+            # The container runs as UID 0 but drops ALL capabilities and adds
+            # back exactly ONE: DAC_OVERRIDE. Running as a non-root user
+            # (runAsUser) was investigated and does NOT work here: Kubernetes
+            # CRI/containerd never populates the *ambient* capability set, so an
+            # added capability has no effect for a non-root uid — execve clears
+            # the effective/permitted sets and the process ends up with an empty
+            # effective set (EPERM connecting to the NRI socket and on resctrl
+            # mkdir). True non-root would require file capabilities on the binary
+            # (setcap), which allowPrivilegeEscalation:false / NoNewPrivs then
+            # blocks. So "root uid, single capability" is the least-privilege
+            # form actually achievable via securityContext for this workload.
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              # DAC_OVERRIDE is the ONLY capability the plugin needs. The
+              # /sys/fs/resctrl/mon_groups directory is root-owned mode 0555,
+              # so creating a per-pod mon_group (mkdir) and writing container
+              # PIDs into its root-owned `tasks` file both require bypassing
+              # the DAC permission check. This was verified empirically on the
+              # target kernel (resctrl-cap-probe): a non-root uid with
+              # DAC_OVERRIDE alone PASSES mkdir + tasks-write and FAILS with
+              # only SYS_ADMIN. The plugin does monitoring only (no schemata /
+              # allocation writes), so CAP_SYS_ADMIN is not required.
+              add: ["DAC_OVERRIDE"]
+            # Ubuntu's default containerd AppArmor profile denies writes to
+            # /sys, which blocks mkdir under /sys/fs/resctrl/mon_groups even
+            # with DAC_OVERRIDE. Run unconfined so the plugin can manage
+            # resctrl mon_groups.
+            appArmorProfile:
+              type: Unconfined
+          resources:
+            requests:
+              cpu: 10m
+              memory: 50Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nri/resctrl-mon
+            - name: nrisockets
+              mountPath: /var/run/nri
+              readOnly: true
+            - name: resctrlfs
+              mountPath: /sys/fs/resctrl
+      volumes:
+        - name: config
+          configMap:
+            name: nri-resctrl-mon-config
+        - name: nrisockets
+          hostPath:
+            path: /var/run/nri
+            type: DirectoryOrCreate
+        - name: resctrlfs
+          hostPath:
+            path: /sys/fs/resctrl
+            type: Directory

@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: Copyright 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+ARG ROCKY_BASE_IMAGE=quay.io/rockylinux/rockylinux:10
+FROM ${ROCKY_BASE_IMAGE}
+
+ENV DNF_YUM_AUTO_USERNAME=1 \
+    DNF_ASSUMEYES=1 \
+    LANG=en_US.UTF-8 \
+    LC_ALL=en_US.UTF-8
+
+RUN dnf -y update && \
+    dnf install -y dnf-plugins-core && \
+    { dnf config-manager --set-enabled crb || true; } && \
+    dnf groupinstall -y "Development Tools" && \
+    dnf install -y \
+        git ncurses-devel elfutils-libelf-devel openssl-devel bc bison \
+        flex dwarves perl-IPC-Cmd perl-FindBin python3-devel rpm-build \
+        rpmdevtools llvm clang lld perl openssl rsync && \
+    dnf clean all && \
+    rm -rf /var/cache/dnf
+
+WORKDIR /workspace
+
+COPY container-build.sh /usr/local/bin/container-build.sh
+RUN chmod 0755 /usr/local/bin/container-build.sh
+
+ENTRYPOINT ["/usr/local/bin/container-build.sh"]

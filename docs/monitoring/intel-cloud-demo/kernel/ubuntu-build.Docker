@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: Copyright 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Build environment for the AET kernel. The base image tracks the Ubuntu series
+# the target node runs (cluster/20-kernel-build.sh captures it), so the
+# toolchain matches the distro whose kernel source we rebuild. Pin by digest for
+# a fully reproducible build:
+#   --build-arg UBUNTU_IMAGE=ubuntu:26.04@sha256:<digest>
+ARG UBUNTU_IMAGE=ubuntu:26.04
+FROM ${UBUNTU_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# deb-src feeds both `apt-get build-dep linux` here and `apt-get source linux`
+# at run time; the sed covers the archive and security stanzas alike.
+RUN sed -i 's|^Types: deb$|Types: deb deb-src|' /etc/apt/sources.list.d/ubuntu.sources && \
+    apt-get update && \
+    apt-get build-dep -yq linux && \
+    apt-get install -yq --no-install-recommends \
+        ca-certificates git bc bison flex libssl-dev libelf-dev dwarves libncurses-dev \
+        zstd pahole ccache fakeroot devscripts dpkg-dev quilt llvm clang lld && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+COPY container-build.sh /usr/local/bin/container-build.sh
+RUN chmod 0755 /usr/local/bin/container-build.sh
+
+ENTRYPOINT ["/usr/local/bin/container-build.sh"]

@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: Copyright 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+# monitoring namespace for the AET telemetry stack.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+  labels:
+    app.kubernetes.io/part-of: aet-telemetry
+    # PodSecurity: the stack needs privileged Pods (host mounts for the RAPL
+    # exporter and hostPID for nri-resctrl-mon), so enforce=privileged; warn and
+    # audit at restricted surface any new Pod that drifts from least-privilege.
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted

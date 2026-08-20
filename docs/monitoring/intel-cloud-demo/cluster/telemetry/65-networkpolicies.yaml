@@ -1,0 +1,165 @@
+# SPDX-FileCopyrightText: Copyright 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+# Baseline NetworkPolicies for the AET telemetry stack (M-1).
+#
+# Reach-model decision: Grafana (30030) and Prometheus (30090) stay NodePort.
+# The demo's publish path (70-grafana-tunnel.sh) and `40-deploy-telemetry.sh
+# verify` both dial those NodePorts, and the node is single-tenant and reachable
+# only from the operator workstation in the intended threat model. Rather than
+# switch to ClusterIP (which would rewire the tunnel/verify flows), we contain
+# lateral movement with a default-deny-ingress policy plus explicit allow-rules
+# for exactly the scrape/serve graph:
+#
+#   grafana:3000            <- published (NodePort / tunnel)
+#   prometheus:9090         <- grafana + published (NodePort / verify)
+#   kube-state-metrics:8080 <- prometheus
+#   otel-collector:8889     <- prometheus        (metrics scrape)
+#   otel-collector:4317     <- nri-resctrl-mon   (OTLP ingest; see L-4)
+#   rapl-node-exporter:9101 <- prometheus
+#
+# NOT applied by dt1/dt2. Apply with `40-deploy-telemetry.sh netpol` and
+# VALIDATE ON A LIVE CLUSTER FIRST. Two enforcement details cannot be checked
+# offline and may need adjustment on your cluster:
+#   1. Kubelet httpGet readiness probes originate from the node's host network.
+#      Some CNIs exempt host traffic from NetworkPolicy; if yours does not, the
+#      readiness probes (grafana /api/health, prometheus /-/ready, ksm /healthz)
+#      will fail until you add an ipBlock allow for the node/pod CIDR.
+#   2. NodePort ingress to grafana/prometheus is SNAT'd to the node IP (default
+#      externalTrafficPolicy: Cluster). The rules below allow those two serve
+#      ports from any source (0.0.0.0/0) so the publish path keeps working; the
+#      node-level firewall remains the real external perimeter.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: aet-telemetry
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-grafana-ingress
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: aet-telemetry
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: grafana
+  policyTypes:
+    - Ingress
+  ingress:
+    # Published serve port (NodePort / reverse-SSH tunnel).
+    - from:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 3000
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-ingress
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: aet-telemetry
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: prometheus
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # Grafana queries Prometheus.
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: grafana
+        # Published serve port (NodePort / `verify`).
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 9090
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-kube-state-metrics-ingress
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: aet-telemetry
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: kube-state-metrics
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-otel-collector-resctrl-ingress
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: aet-telemetry
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: otel-collector-resctrl
+  policyTypes:
+    - Ingress
+  ingress:
+    # Prometheus scrapes the re-exported per-Pod AET metrics.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - protocol: TCP
+          port: 8889
+    # OTLP ingest is restricted to the nri-resctrl-mon plugin (L-4).
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: nri-resctrl-mon
+      ports:
+        - protocol: TCP
+          port: 4317
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-rapl-node-exporter-ingress
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: aet-telemetry
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: rapl-node-exporter
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - protocol: TCP
+          port: 9101
