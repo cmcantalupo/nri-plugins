@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: Copyright 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+# Both build Dockerfiles COPY only container-build.sh, so send just that to the
+# daemon. This keeps multi-gigabyte kernel/debug packages under build/, captured
+# configs, and patches out of the build context (.gitignore does not affect
+# `docker build`).
+*
+!container-build.sh

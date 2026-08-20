@@ -1,0 +1,129 @@
+# SPDX-FileCopyrightText: Copyright 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+# rapl-node-exporter: per-node package/DRAM RAPL energy.
+#
+# A trimmed Prometheus node-exporter (rapl + textfile collectors) running as an
+# unprivileged DaemonSet on every node (privileged: false, all Linux
+# capabilities dropped). It reads the host powercap sysfs
+# (/sys/class/powercap/intel-rapl:*/energy_uj, root-only) and exposes
+# node_rapl_package_joules_total / node_rapl_dram_joules_total on :9101, scraped
+# via the annotation-based `kubernetes-pods` job.
+#
+# A busybox sidecar (rapl-maxpower-writer) reads the RAPL long_term max-power
+# constraint (constraint_0_max_power_uw, the package TDP cap) and writes it as
+# node_rapl_package_max_power_watts into node-exporter's textfile directory, so
+# the cap is scraped through the same endpoint (and inherits the same `node`
+# label). This gives an independent, whole-package power reference alongside the
+# AET per-Pod measurements, and a per-node power-headroom baseline.
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: rapl-node-exporter
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: rapl-node-exporter
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rapl-node-exporter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rapl-node-exporter
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9101"
+        prometheus.io/path: "/metrics"
+    spec:
+      # AET node only (labelled energy.intel.com/aet=true).
+      nodeSelector:
+        energy.intel.com/aet: "true"
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: node-exporter
+          image: quay.io/prometheus/node-exporter:v1.8.2
+          args:
+            - --path.sysfs=/host/sys
+            - --web.listen-address=:9101
+            - --collector.disable-defaults
+            - --collector.rapl
+            - --collector.textfile
+            - --collector.textfile.directory=/textfile
+          ports:
+            - name: metrics
+              containerPort: 9101
+          securityContext:
+            # Not privileged: powercap energy_uj is root-readable, so UID 0 with a
+            # read-only /host/sys mount is enough — no extra caps or escalation.
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: sys
+              mountPath: /host/sys
+              readOnly: true
+            - name: textfile
+              mountPath: /textfile
+              readOnly: true
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+        # Publishes the RAPL long_term max-power (TDP) constraint as
+        # node_rapl_package_max_power_watts via the node-exporter textfile
+        # collector. The cap is (near) static, so a slow refresh loop suffices.
+        - name: rapl-maxpower-writer
+          image: docker.io/library/busybox:1.36
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              out=/textfile/rapl_maxpower.prom
+              while true; do
+                tmp="$out.$$"
+                {
+                  echo "# HELP node_rapl_package_max_power_watts RAPL long_term max power (TDP) constraint per package in watts."
+                  echo "# TYPE node_rapl_package_max_power_watts gauge"
+                  for d in /host/sys/class/powercap/intel-rapl:*; do
+                    [ -f "$d/constraint_0_max_power_uw" ] || continue
+                    name=$(cat "$d/name" 2>/dev/null || echo "")
+                    case "$name" in package-*) ;; *) continue ;; esac
+                    uw=$(cat "$d/constraint_0_max_power_uw" 2>/dev/null || echo "")
+                    [ -n "$uw" ] || continue
+                    idx=${d##*intel-rapl:}
+                    w=$(awk "BEGIN{printf \"%.3f\", $uw/1000000}")
+                    echo "node_rapl_package_max_power_watts{index=\"$idx\"} $w"
+                  done
+                } > "$tmp" && mv "$tmp" "$out"
+                sleep 60
+              done
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: sys
+              mountPath: /host/sys
+              readOnly: true
+            - name: textfile
+              mountPath: /textfile
+          resources:
+            requests:
+              cpu: 5m
+              memory: 8Mi
+            limits:
+              memory: 32Mi
+      volumes:
+        - name: sys
+          hostPath:
+            path: /sys
+        - name: textfile
+          emptyDir: {}

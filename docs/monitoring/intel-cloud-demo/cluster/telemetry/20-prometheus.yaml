@@ -1,0 +1,231 @@
+# SPDX-FileCopyrightText: Copyright 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+# Prometheus: scrapes the AET telemetry stack via pod annotations.
+# A single `kubernetes-pods` job discovers every pod carrying
+# prometheus.io/scrape=true and honours prometheus.io/{port,path}. This covers
+# kube-state-metrics (8080), otel-collector-resctrl (8889 — per-pod AET) and
+# rapl-node-exporter (9101 — per-node RAPL).
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: prometheus
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus
+  labels:
+    app.kubernetes.io/name: prometheus
+rules:
+  # All scrape jobs use kubernetes_sd role: pod, so pod read access is the only
+  # privilege required. Do NOT broaden to nodes/services/endpoints/ingresses or
+  # the API-server /metrics endpoint — that needlessly widens what a compromised
+  # Prometheus pod can read cluster-wide.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus
+  labels:
+    app.kubernetes.io/name: prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: monitoring
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: prometheus
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+      external_labels:
+        cluster: aet-demo
+
+    scrape_configs:
+      # Prometheus self-monitoring.
+      - job_name: prometheus
+        static_configs:
+          - targets: ["localhost:9090"]
+
+      # Annotation-based pod discovery. Any pod with
+      #   prometheus.io/scrape: "true"
+      # is scraped on prometheus.io/port (+ optional prometheus.io/path). Used
+      # for the node-local exporters (rapl-node-exporter). Each target's series
+      # describe that same pod, so it is safe to stamp the scraped pod's
+      # node/namespace/name onto them.
+      # kube-state-metrics is excluded here (see its dedicated honor_labels job
+      # below) because its series describe OTHER pods across ALL nodes.
+      - job_name: kubernetes-pods
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+            action: drop
+            regex: kube-state-metrics
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - action: labelmap
+            regex: __meta_kubernetes_pod_label_(.+)
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: kubernetes_namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: kubernetes_pod_name
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            action: replace
+            target_label: node
+
+      # otel-collector-resctrl re-exports per-pod AET for MANY pods, so the
+      # scraped pod (the collector) is NOT the subject of the series. Scrape it
+      # on :8889 with honor_labels so the plugin's own identity labels
+      # (k8s_pod_uid, domain_name, ...) are preserved and never overwritten.
+      - job_name: otel-collector-resctrl
+        honor_labels: true
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+            action: keep
+            regex: otel-collector-resctrl
+          # Pod-role discovery emits one target per declared containerPort
+          # (this collector declares otlp-grpc:4317 and prom-export:8889);
+          # keep only the Prometheus export port, else both become :8889 and
+          # produce duplicate targets/series.
+          - source_labels: [__meta_kubernetes_pod_container_port_name]
+            action: keep
+            regex: prom-export
+          - source_labels: [__address__]
+            action: replace
+            regex: ([^:]+)(?::\d+)?
+            replacement: $1:8889
+            target_label: __address__
+
+      # kube-state-metrics is a cluster-global exporter: its series (kube_pod_info,
+      # ...) describe OTHER pods across ALL nodes, so the scraped pod's node must
+      # NOT be stamped onto them (that would collapse every pod onto the KSM
+      # node). Scrape with honor_labels to preserve KSM's intrinsic node,
+      # namespace, pod and uid labels — which the energy fetcher joins on.
+      - job_name: kube-state-metrics
+        honor_labels: true
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+            action: keep
+            regex: kube-state-metrics
+          # KSM declares http-metrics:8080 and telemetry:8081; pod-role
+          # discovery emits both, so keep only http-metrics before the rewrite
+          # or both collapse to :8080 and double every sample.
+          - source_labels: [__meta_kubernetes_pod_container_port_name]
+            action: keep
+            regex: http-metrics
+          - source_labels: [__address__]
+            action: replace
+            regex: ([^:]+)(?::\d+)?
+            replacement: $1:8080
+            target_label: __address__
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: prometheus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: prometheus
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: prometheus
+    spec:
+      serviceAccountName: prometheus
+      securityContext:
+        runAsUser: 65534
+        runAsNonRoot: true
+        fsGroup: 65534
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v3.13.2
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time=6h
+            # Lifecycle admin API is intentionally disabled: enabling it exposes
+            # unauthenticated /-/reload and /-/quit on the NodePort. Config
+            # changes take effect on redeploy.
+          ports:
+            - name: web
+              containerPort: 9090
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+            - name: data
+              mountPath: /prometheus
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: 9090
+            initialDelaySeconds: 10
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: prometheus
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: prometheus
+  ports:
+    - name: web
+      port: 9090
+      targetPort: 9090
+      nodePort: 30090
