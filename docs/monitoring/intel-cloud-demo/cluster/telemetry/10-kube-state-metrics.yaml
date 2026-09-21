@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 # kube-state-metrics: exposes k8s object metrics (kube_pod_info, etc.)
-# used to join AET series (k8s.pod.uid) back to pod/namespace/node identity.
+# used to join AET series (k8s_pod_uid) back to pod/namespace/node identity.
 # Scraped via the annotation-based `kubernetes-pods` Prometheus job (port 8080).
 ---
 apiVersion: v1

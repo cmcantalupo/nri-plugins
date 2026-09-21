@@ -26,9 +26,9 @@ BUILD_DIR="${KERNEL_BUILD_DIR:?}"; BUILD_DIR="${BUILD_DIR/#\~/$HOME}"
 DEB_DIR="$BUILD_DIR/build/deb"
 RPM_DIR="$BUILD_DIR/build/rpm"
 
-# Per-invocation staging dir on each node. Recreated fresh by `ship` and the
-# only place `install` reads from, so a rebuilt kernel never installs alongside
-# leftover packages from an earlier build sitting in shared /tmp.
+# Per-invocation staging dir on each node. `ship` refuses an existing path:
+# choose a new NODE_STAGE when shipping again rather than deleting old files.
+# `install` reads only this directory, never a shared package glob in /tmp.
 NODE_STAGE="${NODE_STAGE:-/tmp/aet-kernel-stage}"
 
 # Ship the bootable image + matching headers; skip the huge -dbg symbols package.
@@ -56,8 +56,9 @@ cmd_ship() {
     list="$(pkg_list_for "$fam")"
     [[ -n "$list" ]] || die "no $fam kernel packages in $(pkg_dir_for "$fam") — build first (20-kernel-build.sh)"
     log "K-T3 ship ($fam) to $n:$NODE_STAGE"
-    # Recreate the staging dir so only this invocation's packages are present.
-    nssh "$n" "rm -rf '$NODE_STAGE' && mkdir -p '$NODE_STAGE'"
+    # Refuse reuse (including dangling symlinks) without deleting any files.
+    nssh "$n" "test ! -e '$NODE_STAGE' && test ! -L '$NODE_STAGE' && mkdir -m 700 '$NODE_STAGE'" \
+      || die "could not create fresh $NODE_STAGE on $n — choose an unused NODE_STAGE"
     for f in $list; do
       scp $SSH_OPTS "$f" "$n:$NODE_STAGE/" >/dev/null
       a="$(sha256sum "$f" | cut -d' ' -f1)"
@@ -86,17 +87,30 @@ cmd_install() {
 
 # Debian/Ubuntu install: dpkg + GRUB (update-grub / grub-set-default).
 install_deb() {
-  local n="$1"
-  nssh "$n" "sudo bash -s -- '$STOCK_KERNEL' '$KERNEL_TAG' '${KERNEL_CMDLINE_ADD:-rdt=perf}' '$NODE_STAGE'" <<'EOF'
+  local n="$1" stock_id
+  stock_id="$(grub_id_for "$n" "$STOCK_KERNEL")" \
+    || die "could not resolve the stock GRUB entry for $STOCK_KERNEL on $n"
+  [[ -n "$stock_id" ]] || die "empty stock GRUB entry for $STOCK_KERNEL on $n"
+  nssh "$n" "sudo -n bash -s -- '$STOCK_KERNEL' '$KERNEL_TAG' '${KERNEL_CMDLINE_ADD:-rdt=perf}' '$NODE_STAGE' '$stock_id'" <<'EOF'
 set -e
-STOCK_KERNEL="$1"; KERNEL_TAG="$2"; KERNEL_CMDLINE_ADD="$3"; STAGE="$4"
+STOCK_KERNEL="$1"; KERNEL_TAG="$2"; KERNEL_CMDLINE_ADD="$3"; STAGE="$4"; STOCK_ID="$5"
 shopt -s nullglob
 # Verify the documented stock fallback kernel is actually present BEFORE
 # installing anything, so a mistyped/missing STOCK_KERNEL can't leave the
 # freshly-installed (untested) kernel as the boot default with no known-good
 # entry to fall back to.
 [ -e "/boot/vmlinuz-$STOCK_KERNEL" ] || { echo "FATAL: stock kernel /boot/vmlinuz-$STOCK_KERNEL not found on the node — set STOCK_KERNEL to the node's current stock kernel (see ./00-probe.sh) before installing" >&2; exit 1; }
-dpkg -i "$STAGE"/linux-image-*.deb "$STAGE"/linux-headers-*.deb 2>/dev/null || dpkg -i "$STAGE"/linux-image-*.deb
+# Pin the complete submenu>entry path BEFORE dpkg invokes update-grub. Even
+# if package installation fails, the untested kernel must not become default.
+sed -i 's/^GRUB_DEFAULT=.*/GRUB_DEFAULT=saved/' /etc/default/grub
+grep -q '^GRUB_DEFAULT=' /etc/default/grub || echo 'GRUB_DEFAULT=saved' >> /etc/default/grub
+sed -i 's/^GRUB_SAVEDEFAULT=.*/GRUB_SAVEDEFAULT=false/' /etc/default/grub
+grep -q '^GRUB_SAVEDEFAULT=' /etc/default/grub || echo 'GRUB_SAVEDEFAULT=false' >> /etc/default/grub
+grub-set-default "$STOCK_ID"
+update-grub
+grep -Fq 'set default="${saved_entry}"' /boot/grub/grub.cfg \
+  || { echo 'FATAL: generated GRUB config does not use the saved fallback' >&2; exit 1; }
+dpkg -i "$STAGE"/linux-image-*.deb "$STAGE"/linux-headers-*.deb
 # Put required boot args (e.g. rdt=perf for AET) on the deployed kernel command
 # line. Append to GRUB_CMDLINE_LINUX so every menu entry (incl. the new kernel)
 # gets them; create the line if the distro omits it. AET exposes no resctrl
@@ -111,18 +125,20 @@ for tok in $KERNEL_CMDLINE_ADD; do
     echo "GRUB_CMDLINE_LINUX=\"${tok}\"" >> /etc/default/grub
   fi
 done
-# Pin GRUB to boot the *saved* entry, and set that saved entry to the STOCK kernel.
-sed -i 's/^GRUB_DEFAULT=.*/GRUB_DEFAULT=saved/' /etc/default/grub
-grep -q '^GRUB_DEFAULT=' /etc/default/grub || echo 'GRUB_DEFAULT=saved' >> /etc/default/grub
 update-grub
 # Fail loudly if a required boot arg did not make it into the generated config.
 for tok in $KERNEL_CMDLINE_ADD; do
   grep -q -- "$tok" /boot/grub/grub.cfg \
     || { echo "FATAL: '$tok' missing from /boot/grub/grub.cfg after update-grub" >&2; exit 1; }
 done
-STOCK_ID=$(grep 'menuentry ' /boot/grub/grub.cfg | grep -- "$STOCK_KERNEL" | grep -v recovery \
-           | sed -n "s/.*\\\$menuentry_id_option '\\([^']*\\)'.*/\\1/p" | head -1)
-[ -n "$STOCK_ID" ] || { echo "FATAL: could not find stock grub entry for $STOCK_KERNEL" >&2; exit 1; }
+grep -Fq "'${STOCK_ID##*>}'" /boot/grub/grub.cfg \
+  || { echo 'FATAL: stock GRUB entry disappeared after installation' >&2; exit 1; }
+if [[ "$STOCK_ID" == *'>'* ]]; then
+  grep -Fq "'${STOCK_ID%%>*}'" /boot/grub/grub.cfg \
+    || { echo 'FATAL: stock GRUB submenu disappeared after installation' >&2; exit 1; }
+fi
+grep -Fq 'set default="${saved_entry}"' /boot/grub/grub.cfg \
+  || { echo 'FATAL: generated GRUB config does not use the saved fallback' >&2; exit 1; }
 grub-set-default "$STOCK_ID"
 echo "  installed: $(ls /boot/vmlinuz-*"$KERNEL_TAG"* 2>/dev/null || echo MISSING)"
 echo "  initramfs: $(ls /boot/initrd.img-*"$KERNEL_TAG"* 2>/dev/null || echo MISSING)"
@@ -204,10 +220,34 @@ echo "  default   : $(sudo grubby --default-kernel 2>/dev/null)"
 EOF
 }
 
-# resolve a node's grub menuentry_id_option for a given kernel version substring
-grub_id_for() { # <node> <kver-substr>
-  nssh "$1" "sudo grep 'menuentry ' /boot/grub/grub.cfg | grep -- '$2' | grep -v recovery \
-    | sed -n \"s/.*\\\$menuentry_id_option '\\([^']*\\)'.*/\\1/p\" | head -1"
+# Resolve Ubuntu-generated exact release IDs, including the enclosing submenu.
+# A bare child ID cannot select an entry under "Advanced options for Ubuntu".
+grub_id_from_config() { # <kernel release>, grub.cfg on stdin
+  awk -v release="$1" '
+    /^[[:space:]]*(submenu|menuentry)[[:space:]]/ {
+      if (found) next
+      line = $0
+      if (!sub(/^.*\$menuentry_id_option[[:space:]]+/, "", line)) next
+      split(line, fields, "\047")
+      id = fields[2]
+      if ($0 ~ /^submenu[[:space:]]/) { submenus[id] = 1; next }
+      prefix = "gnulinux-" release "-advanced-"
+      if ($0 !~ /^[[:space:]]*menuentry[[:space:]]/ || index(id, prefix) != 1) next
+      if ($0 ~ /^menuentry[[:space:]]/) {
+        print id
+      } else {
+        parent = "gnulinux-advanced-" substr(id, length(prefix) + 1)
+        if (!(parent in submenus)) next
+        print parent ">" id
+      }
+      found = 1
+    }
+    END { if (!found) exit 1 }
+  '
+}
+
+grub_id_for() { # <node> <exact kernel release>
+  nssh "$1" 'sudo -n cat /boot/grub/grub.cfg' | grub_id_from_config "$2"
 }
 
 # resolve a node's grubby boot index for the given kernel release (RHEL-family)

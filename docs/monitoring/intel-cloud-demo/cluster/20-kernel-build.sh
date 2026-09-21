@@ -198,13 +198,15 @@ cmd_verify() {
 
 # Verify the built .deb embeds the required CONFIG_* symbols, kept the node's
 # drivers, and matches KERNEL_TAG.
-verify_deb() {
+# Isolate cleanup in a subshell: EXIT handles failures as well as success,
+# without leaving a RETURN trap that outlives the local tmp variable.
+verify_deb() (
   local deb
   deb="$(ls -t "$BUILD_DIR"/build/deb/linux-image-*.deb 2>/dev/null | grep -v -- '-dbg_' | head -1)" \
     || die "no linux-image .deb in $BUILD_DIR/build/deb"
   [[ -n "$deb" ]] || die "no non-debug linux-image .deb in $BUILD_DIR/build/deb"
   log "verifying $(basename "$deb")"
-  local tmp; tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' RETURN
+  local tmp; tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
   ( cd "$tmp" && dpkg-deb --fsys-tarfile "$deb" | tar -xO --wildcards './boot/config-*' 2>/dev/null > cfg )
   [[ -s "$tmp/cfg" ]] || die "could not extract embedded config from $deb"
   local ok=1 sym
@@ -254,13 +256,13 @@ verify_deb() {
   fi
 
   [[ "$ok" == "1" ]] && log "verify PASSED — $(basename "$deb")" || die "verify FAILED — do NOT install this .deb"
-}
+)
 
 # Verify the built .rpm embeds the required CONFIG_* symbols, kept the node's
 # drivers, and matches KERNEL_TAG. The in-container build already refuses a tree
 # that does not define the AET symbol and re-asserts it after olddefconfig; this
 # is the belt-and-suspenders check on the produced artifact.
-verify_rpm() {
+verify_rpm() (
   local rpm
   # Exclude source RPMs (kernel-*.src.rpm): they are not bootable artifacts and
   # carry no /boot/config-* to verify. If the .src.rpm has the newest mtime it
@@ -269,7 +271,7 @@ verify_rpm() {
     || die "no kernel .rpm in $BUILD_DIR/build/rpm"
   [[ -n "$rpm" ]] || die "no kernel .rpm in $BUILD_DIR/build/rpm"
   log "verifying $(basename "$rpm")"
-  local tmp; tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' RETURN
+  local tmp; tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 
   # Stream the embedded /boot/config out of the rpm. Prefer bsdtar (libarchive
   # reads rpm payloads directly, so the build host needs no rpm tooling); fall
@@ -337,7 +339,7 @@ verify_rpm() {
   if [[ -f "$prov" ]]; then log "provenance:"; sed 's/^/    /' "$prov"; else warn "no provenance file next to the .rpm"; fi
 
   [[ "$ok" == "1" ]] && log "verify PASSED — $(basename "$rpm")" || die "verify FAILED — do NOT install this .rpm"
-}
+)
 
 cmd_all() { cmd_capture; cmd_build; cmd_build_wait; cmd_verify; }
 

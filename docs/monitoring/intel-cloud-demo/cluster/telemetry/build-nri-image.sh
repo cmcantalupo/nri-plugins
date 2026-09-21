@@ -97,7 +97,10 @@ git_rev() {
   echo "$sha"
 }
 
-cmd_build() {
+# Keep temporary-context cleanup local to the build, including failure exits.
+# A RETURN trap would otherwise survive into cmd_import after stage goes out
+# of scope and fail under set -u.
+cmd_build() (
   # Host git clones don't use Docker's daemon/client proxy config; export the
   # inventory proxy so the fork fetches work behind one (no-op if PROXY_URL is
   # unset, e.g. an Intel Cloud build host with direct egress).
@@ -115,7 +118,9 @@ cmd_build() {
   # path (=> /abs or ./rel, invisible to a Docker build) or when the operator
   # points GORESCTRL_SRC at their own checkout to iterate on goresctrl locally.
   local gores_replace gores_target vendor_goresctrl=0
-  gores_replace="$(grep -E 'goresctrl[^=]*=>' "$NRI_SRC/go.mod" | sed -E 's#.*=> *##' | head -1)"
+  # A normal upstream require needs no replace. Do not let an absent optional
+  # override abort the build under pipefail (as grep would).
+  gores_replace="$(awk '/goresctrl[^=]*=>/ && !found { sub(/^.*=>[[:space:]]*/, ""); print; found=1 }' "$NRI_SRC/go.mod")"
   gores_target="${gores_replace%% *}"
   if [[ "$GORESCTRL_SRC" != "$SRC_CACHE/goresctrl" ]]; then
     vendor_goresctrl=1
@@ -130,7 +135,7 @@ cmd_build() {
   log "nri-plugins  @ $nri_sha ($NRI_REPO @ $NRI_BRANCH)"
 
   local stage; stage="$(mktemp -d)"
-  trap 'rm -rf "$stage"' RETURN
+  trap 'rm -rf "$stage"' EXIT
   log "staging build context in $stage"
   rsync -a --exclude '.git' --exclude 'build/' --exclude 'vendor/' "$NRI_SRC"/ "$stage"/
 
@@ -149,11 +154,15 @@ cmd_build() {
     grep -q '=> ./_goresctrl-fork' "$stage/go.mod" \
       || die "no goresctrl replace to repoint in $NRI_SRC/go.mod (add one, or unset GORESCTRL_SRC)"
   else
-    # go.mod already pins a fetchable goresctrl module; build straight from it.
-    goresctrl_source="${gores_replace:-<none> (goresctrl unmodified)}"
-    goresctrl_sha="${gores_replace##*-}"
-    [[ "$gores_replace" == *-* ]] || goresctrl_sha="unknown"
-    log "goresctrl    <- go.mod replace: $goresctrl_source"
+    # go.mod pins a fetchable module, either upstream or via a remote replace.
+    goresctrl_source="$gores_replace"
+    if [[ -z "$goresctrl_source" ]]; then
+      goresctrl_source="$(awk '$1 == "github.com/intel/goresctrl" { print $1 " " $2; exit }' "$NRI_SRC/go.mod")"
+    fi
+    goresctrl_source="${goresctrl_source:-unknown}"
+    goresctrl_sha="${goresctrl_source##*-}"
+    [[ "$goresctrl_source" == *-* ]] || goresctrl_sha="unknown"
+    log "goresctrl    <- go.mod: $goresctrl_source"
   fi
 
   cat > "$stage/Dockerfile.aet" <<'DOCKER'
@@ -199,7 +208,7 @@ PROV
   log "wrote provenance -> $STAGE_DIR/${TAR%.tar}.provenance"
   log "docker save -> $STAGE_DIR/$TAR"
   docker save "$IMAGE" -o "$STAGE_DIR/$TAR"
-}
+)
 
 cmd_import() {
   [[ -f "$STAGE_DIR/$TAR" ]] || die "image tar not found: $STAGE_DIR/$TAR (run build first)"

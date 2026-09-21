@@ -5,8 +5,8 @@
 # nri-resctrl-mon pushes per-pod AET counters (perf.core.energy, perf.activity,
 # ...) over OTLP/gRPC to this collector. The k8sattributes processor resolves
 # k8s.pod.uid -> namespace/pod/node identity, then the Prometheus exporter
-# renders them on :8889 keeping the plugin's dotted names (e.g.
-# perf.core.energy_joules_total),
+# renders them on :8889 using Prometheus underscore names (e.g.
+# perf_core_energy_joules_total), matching the plugin's Grafana dashboards,
 # where the annotation-based `kubernetes-pods` job scrapes them.
 #
 # Deployed as a single replica fronted by a ClusterIP Service so the plugin has
@@ -73,11 +73,11 @@ data:
     exporters:
       prometheus:
         endpoint: 0.0.0.0:8889
-        # Keep the plugin's dotted OTLP names (perf.core.energy, k8s.pod.uid) and
-        # still append unit/_total suffixes, giving perf.core.energy_joules_total
-        # exactly as the resctrl-mon dashboards query it. Needs Prometheus 3.x,
-        # which negotiates escaping=allow-utf-8 when scraping.
-        translation_strategy: NoUTF8EscapingWithSuffixes
+        # Normalize BOTH OTLP metric names and attribute labels to match the
+        # upstream dashboards: perf_core_energy_joules_total, k8s_pod_uid,
+        # resctrl_group_source. Keeping dots yields healthy scrapes but empty
+        # dashboard queries and Pod-identity joins.
+        translation_strategy: UnderscoreEscapingWithSuffixes
         resource_to_telemetry_conversion:
           enabled: true
     service:

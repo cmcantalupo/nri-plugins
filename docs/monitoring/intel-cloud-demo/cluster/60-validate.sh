@@ -28,12 +28,11 @@ NODE=${NODE:-$(server_node)}
 PROM_NS=${PROM_NS:-monitoring}
 WIN=${WIN:-5m}
 
-# AET per-pod series carry k8s.pod.uid; kube_pod_info carries the uid as `uid`.
-# The collector keeps the plugin's dotted OTLP names, so these are UTF-8 names
-# and must be quoted inside the selector (Prometheus 3 syntax).
+# The collector normalizes OTLP names to Prometheus underscores, matching the
+# plugin dashboards. AET series carry k8s_pod_uid; kube_pod_info carries `uid`.
 # This fragment lifts the node label onto each AET sample so it can be summed
 # per node.
-JOIN='* on ("k8s.pod.uid") group_left(node) label_replace(kube_pod_info, "k8s.pod.uid", "$1", "uid", "(.*)")'
+JOIN='* on (k8s_pod_uid) group_left(node) label_replace(kube_pod_info, "k8s_pod_uid", "$1", "uid", "(.+)")'
 
 promq() {
   local u
@@ -76,11 +75,11 @@ case "$cmd" in
     echo "== RAPL DRAM power (W) [referee] =="
     promq "sum by (node) (rate(node_rapl_dram_joules_total[$WIN]))" | show W
     echo "== AET core power (W) [measured] =="
-    promq "sum by (node) (rate({__name__=\"perf.core.energy_joules_total\"}[$WIN]) $JOIN)" | show W
+    promq "sum by (node) (rate(perf_core_energy_joules_total{resctrl_group_source=\"pod\"}[$WIN]) $JOIN)" | show W
     ;;
   eff)
     echo "== AET efficiency J/uop [lower = more efficient] =="
-    promq "sum by (node) (rate({__name__=\"perf.core.energy_joules_total\"}[$WIN]) $JOIN) / sum by (node) (rate({__name__=\"perf.uops.retired_total\"}[$WIN]) $JOIN)" | show J/uop
+    promq "sum by (node) (rate(perf_core_energy_joules_total{resctrl_group_source=\"pod\"}[$WIN]) $JOIN) / sum by (node) (rate(perf_uops_retired_total{resctrl_group_source=\"pod\"}[$WIN]) $JOIN)" | show J/uop
     ;;
   energy)
     dur=${1:?usage: energy <dur> e.g. 10m}

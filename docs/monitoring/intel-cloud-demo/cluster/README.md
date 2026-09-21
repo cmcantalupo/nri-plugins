@@ -71,20 +71,21 @@ Prometheus → Grafana, with `rapl-node-exporter` providing a per-node reference
 
 ## Data model
 
-The collector keeps the plugin's **dotted OTLP names**
-(`translation_strategy: NoUTF8EscapingWithSuffixes`), so series are named
-`perf.core.energy_joules_total` and carry `k8s.pod.uid` and
-`resctrl.group.source="pod"`. These are UTF-8 names: they must be quoted inside
-the selector, which requires **Prometheus 3.x**.
+The collector translates the plugin's dotted OTLP names to **Prometheus
+underscore names** (`translation_strategy: UnderscoreEscapingWithSuffixes`),
+matching the plugin's published dashboards. Series are named
+`perf_core_energy_joules_total` and carry `k8s_pod_uid` and
+`resctrl_group_source="pod"`. Preserving dots instead can leave every scrape
+healthy while all dashboard panels report **No data**.
 
 Join them to Pod/namespace/node with `kube_pod_info`, which is a native
 Prometheus exporter and so carries a plain `uid` label:
 
 ```promql
 sum by (pod, namespace) (
-  rate({__name__="perf.core.energy_joules_total", "resctrl.group.source"="pod"}[$__rate_interval])
-  * on("k8s.pod.uid") group_left(pod, namespace)
-    label_replace(last_over_time(kube_pod_info[$__range]), "k8s.pod.uid", "$1", "uid", "(.+)")
+  rate(perf_core_energy_joules_total{resctrl_group_source="pod"}[$__rate_interval])
+  * on(k8s_pod_uid) group_left(pod, namespace)
+    label_replace(max by (uid, pod, namespace) (last_over_time(kube_pod_info[$__range])), "k8s_pod_uid", "$1", "uid", "(.+)")
 )
 ```
 
@@ -93,7 +94,27 @@ Perf Counters (Intel AET / resctrl-mon)** dashboards use exactly this pattern.
 They are not written here: `40-deploy-telemetry.sh` installs the dashboards
 published with the plugin itself, from
 `deployment/helm/resctrl-mon/optional/grafana-resctrl-*.json` on
-`NRI_REPO@NRI_BRANCH`.
+`NRI_REPO@NRI_BRANCH`. At install time, the plugin dashboards' 5-second query
+min-step is changed to 15 seconds to match this demo's Prometheus scrape
+interval; the source checkout and query expressions are left unchanged. The
+Grafana datasource also declares a 15-second scrape interval. Together these
+give `$__rate_interval` a minimum of one minute (four scrapes), rather than a
+20-second window that can contain only one sample and return no rate.
+
+`40-deploy-telemetry.sh verify` checks these metric/label names and the Pod
+identity join and one-minute power rate as well as scrape health. After changing the collector ConfigMap,
+restart its Deployment to load the new configuration. A naming change starts
+new Prometheus series; rate panels need at least two fresh scrapes. Previously
+stored dotted-name series remain in Prometheus until retention expires.
+
+If instant queries succeed but the browser still has empty or delayed panels,
+check the **actual Grafana query** (including its expanded rate interval and
+time range), not just an instant query at the Prometheus server's current time.
+Compare the browser/workstation clock with the node clock and inspect NTP
+synchronization: a node several minutes ahead puts newly collected samples
+outside the browser's `now` range. Fix time synchronization through the node's
+normal administration process; do not silently step a running cluster's clock
+backwards. Scrape health and datasource health alone do not prove panels render.
 
 ## Inventory
 

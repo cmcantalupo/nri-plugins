@@ -25,6 +25,11 @@ data:
         url: http://prometheus.monitoring.svc:9090
         isDefault: true
         editable: true
+        jsonData:
+          # Match 20-prometheus.yaml; $__rate_interval needs at least four
+          # scrape intervals. Dashboard min-step overrides are aligned by
+          # install_dashboards() in 40-deploy-telemetry.sh.
+          timeInterval: 15s
 ---
 # The two dashboard ConfigMaps (grafana-dashboard-pod-energy and
 # grafana-dashboard-pod-perf) are NOT defined here. cluster/40-deploy-telemetry.sh

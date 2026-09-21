@@ -120,14 +120,17 @@ grafana_root_url() {
 
 cmd_grafana() {
   ensure_grafana_secret
-  install_dashboards
   # shellcheck disable=SC2016  # '${GRAFANA_ROOT_URL}' is the envsubst allowlist, not a bash expansion
   GRAFANA_ROOT_URL="$(grafana_root_url)" sapply_env 30-grafana.yaml '${GRAFANA_ROOT_URL}'
+  # Apply datasource settings before install_dashboards restarts Grafana.
+  install_dashboards
   wait_rollout deploy/grafana
 }
 
 # The dashboards are published with the resctrl-mon plugin, not written here, so
-# the demo renders whatever that branch ships. Prefer the checkout
+# retain its panels/queries, adapting its 5s min-step to this demo's 15s scrape
+# interval when rendering the ConfigMaps (never edit the source checkout).
+# Prefer the checkout
 # telemetry/build-nri-image.sh already cloned; otherwise fetch the raw files.
 DASH_PATH="deployment/helm/resctrl-mon/optional"
 install_dashboards() {
@@ -161,10 +164,24 @@ install_dashboards() {
   for cm in pod-energy:grafana-dashboard-pod-energy pod-perf:grafana-dashboard-pod-perf; do
     key="${cm%%:*}.json"
     python3 - "$tmp/$key" "$key" "${cm##*:}" "$NS" <<'PY' |
-import sys
+import json, sys
 # Emitted by hand as a literal block rather than with PyYAML, which is not in
 # the standard library and would be an undeclared prerequisite.
 path, key, name, ns = sys.argv[1:5]
+with open(path) as f:
+    dashboard = json.load(f)
+
+def align_scrape_interval(panels):
+    for panel in panels:
+        for target in panel.get("targets", []):
+            # A target min-step overrides datasource.timeInterval for
+            # $__rate_interval. 5s produces a 20s window, often containing
+            # only one sample at the actual 15s scrape cadence.
+            if target.get("interval") == "5s":
+                target["interval"] = "15s"
+        align_scrape_interval(panel.get("panels", []))
+
+align_scrape_interval(dashboard.get("panels", []))
 print("apiVersion: v1")
 print("kind: ConfigMap")
 print("metadata:")
@@ -174,7 +191,7 @@ print("  labels:")
 print("    app.kubernetes.io/name: grafana")
 print("data:")
 print(f"  {key}: |")
-for line in open(path).read().splitlines():
+for line in json.dumps(dashboard, indent=2, ensure_ascii=False).splitlines():
     print("    " + line if line else "")
 PY
       nssh "$(server_node)" "sudo k3s kubectl apply -f -" >/dev/null
@@ -307,8 +324,17 @@ cmd_verify() {
 
   check_series 'kube_pod_info'                       'count(kube_pod_info)'                               || rc=1
   echo
-  check_series 'per-pod AET (perf.core.energy_joules_total)' \
-                                                     'count({__name__="perf.core.energy_joules_total"})' || rc=1
+  # Check the exact metric/labels used by the provisioned dashboards, not just
+  # the existence of any AET series: naming mismatches otherwise pass verify
+  # while every panel is empty.
+  check_series 'per-pod AET (perf_core_energy_joules_total)' \
+    'count(perf_core_energy_joules_total{resctrl_group_source="pod",k8s_pod_uid!=""})' || rc=1
+  echo
+  check_series 'dashboard Pod identity join' \
+    'count(perf_core_energy_joules_total{resctrl_group_source="pod",k8s_pod_uid!=""} * on(k8s_pod_uid) group_left(pod,namespace) label_replace(max by(uid,pod,namespace) (kube_pod_info), "k8s_pod_uid", "$1", "uid", "(.+)"))' || rc=1
+  echo
+  check_series 'dashboard power rate (1m minimum window at 15s scrapes)' \
+    'count(rate(perf_core_energy_joules_total{resctrl_group_source="pod",k8s_pod_uid!=""}[1m]))' || rc=1
   echo
   check_series 'per-node RAPL (node_rapl_package_joules_total)' \
                                                      'count(node_rapl_package_joules_total)'              || rc=1
